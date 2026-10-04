@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "target": {
+    "processId": 0,
+    "imageName": "",
+    "imagePath": ""
+  },
+  "hotkeys": {
+    "toggleBlocking":     { "modifiers": 3, "virtualKey": 119 },
+    "toggleClickThrough": { "modifiers": 3, "virtualKey": 120 },
+    "toggleOverlay":      { "modifiers": 3, "virtualKey": 121 },
+    "toggleBorder":       { "modifiers": 3, "virtualKey": 122 }
+  },
+  "network": {
+    "blockOnStartup": false,
+    "removeRulesOnExit": true,
+    "terminateExistingConnections": true
+  },
+  "window": {
+    "x": 80,
+    "y": 80,
+    "width": 620,
+    "height": 800,
+    "showInTaskbar": true
+  },
+  "ui": {
+    "language": "ru"
+  },
+  "overlay": {
+    "transparencyMode": "direct-composition",
+    "clickThrough": false,
+    "visible": true,
+    "topmost": true,
+    "noActivate": false,
+    "excludeFromCapture": false,
+    "border": {
+      "enabled": true,
+      "thickness": 3.0,
+      "hueSpeed": 0.35,
+      "saturation": 1.0,
+      "value": 1.0,
+      "glow": true
+    },
+    "gif": {
+      "enabled": true,
+      "scale": 1.0,
+      "path": ""
+    }
+  },
+  "processes": {
+    "showSystemProcesses": false,
+    "refreshIntervalMs": 1000
+  },
+  "logging": {
+    "level": 2
+  }
+}

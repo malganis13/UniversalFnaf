@@ -1,0 +1,404 @@
+# UniversalFnaf
+
+Неинвазивная утилита для Windows: фильтрация **исходящего** трафика одного
+выбранного пользовательского процесса через официальный Windows Filtering
+Platform (WFP) + графический оверлей на Dear ImGui / DirectX 11 с анимированной
+RGB-рамкой, GIF-анимацией, глобальными хоткеями и режимом сквозного клика.
+
+```
+Стек: C++20 · CMake 3.24+ · MSVC 2022 (x64) · Dear ImGui v1.90.9 (DX11 backend)
+      Windows SDK 10 (WFP, DWM, DirectComposition, GDI+, SHELL32) · nlohmann/json
+```
+
+---
+
+## 1. Главный принцип: нулевой след в чужих процессах
+
+| Что утилита делает | Через что | Что она **никогда** не делает |
+|---|---|---|
+| Блокирует исходящий трафик | `FwpmEngineOpen0` + `FwpmFilterAdd0` (ALE_AUTH_CONNECT v4/v6, `FWPM_CONDITION_ALE_APP_ID`) | Не ставит драйвер, NDIS-фильтр, WFP-callout, LSP |
+| Читает путь к .exe | `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` + `QueryFullProcessImageNameW` | Не запрашивает `PROCESS_VM_READ`, `PROCESS_VM_WRITE`, `PROCESS_VM_OPERATION`, `PROCESS_CREATE_THREAD` |
+| Перечисляет процессы | `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)` | Не открывает чужие адресные пространства |
+| Глобальные хоткеи | `RegisterHotKey` / `UnregisterHotKey` | Не ставит `WH_KEYBOARD_LL` / `WH_KEYBOARD`, не хукает ввод |
+| Захват комбинации клавиш в UI | `GetAsyncKeyState` (опрос, без фокуса) | Не использует хуки и не читает чужой ввод |
+| Рисует оверлей | Собственное окно + `CreateSwapChainForComposition` + DirectComposition | Не читает чужие поверхности, не рисует в чужой DC, не делает `BitBlt` с чужих окон |
+| Иконки процессов, GIF | `SHGetFileInfoW` + GDI+ как декодер | Никаких сторонних бинарников и обфускации |
+| Очистка при выходе | `FWPM_SESSION_FLAG_DYNAMIC` — ядро само снимает фильтры | Не оставляет постоянных правил в хранилище WFP |
+
+В коде нет ни одного вхождения `VirtualAllocEx`, `WriteProcessMemory`,
+`CreateRemoteThread`, `SetWindowsHookEx`, `QueueUserAPC`, `NtMapViewOfSection`,
+`MinHook`, `Detours`, `LoadLibrary` в чужой процесс. Проверяется одной командой:
+
+```powershell
+Select-String -Path .\src\*.cpp,.\src\**\*.cpp -Pattern `
+  'VirtualAllocEx|WriteProcessMemory|CreateRemoteThread|SetWindowsHookEx|QueueUserAPC|Detours|MinHook'
+# ожидаемый результат: пусто
+```
+
+### Почему это важно для антивирусов и античитов
+
+* Нет инжекта, хуков и патчинга памяти — исчезает основная масса эвристик
+  «injector / hooker / game cheat».
+* Нет упаковщика и обфускации: бинарник статически слинкован, рядом лежит
+  читаемый исходник.
+* Единственный «громкий» признак — `requireAdministrator` и работа с WFP.
+  Поэтому бинарник **следует подписывать** (см. §7): для подписанного кода
+  эвристики ложных срабатываний существенно ниже.
+
+> Честное ограничение: оверлей поверх игры — это всё равно оверлей. Некоторые
+> античиты реагируют на сам факт topmost-окна. Архитектура убирает классические
+> триггеры (инжект/хуки/чтение памяти), но **не даёт гарантии** совместимости с
+> конкретным античитом. Перед использованием проверьте правила игры; утилита
+> предназначена для фильтрации собственного трафика на собственной машине.
+
+---
+
+## 2. Структура проекта
+
+```
+UniversalFnaf/
+├─ CMakeLists.txt                 # сборка, зависимости, линковка (d3d11/dcomp/fwpuclnt/gdiplus/...)
+├─ CMakePresets.json              # пресеты MSVC x64 Debug/Release, Ninja
+├─ resources/
+│  ├─ app.manifest                # requireAdministrator, PerMonitorV2, longPathAware, UTF-8
+│  └─ universalfnaf.rc                  # RT_MANIFEST id 1 (embed) + VERSIONINFO
+├─ config/config.example.json     # образец конфигурации
+├─ include/universalfnaf/
+│  ├─ Common/
+│  │  ├─ WinError.h               # исключения Win32/HRESULT, RAII-дескриптор, UTF-8 <-> UTF-16
+│  │  ├─ Logger.h                 # ILogger + FileLogger (файл + OutputDebugString)
+│  │  ├─ Utils.h                  # пути, HSV->RGB, форматирование хоткеев, ScopeGuard
+│  │  ├─ GdiPlusSession.h         # RAII GDI+, HICON -> RGBA, BGRA(premult) -> RGBA(straight)
+│  │  ├─ Localization.h           # таблица строк RU/ENG (UiStrings, UiLanguage)
+│  │  └─ TransparencyMode.h       # режим прозрачности (без зависимости Core -> UI)
+│  ├─ Core/ConfigManager.h        # AppConfig + config.json (атомарная запись)
+│  ├─ Net/
+│  │  ├─ INetworkFilter.h         # абстракция + BlockTarget/BlockRuleHandle
+│  │  ├─ WfpFilterManager.h       # реализация на WFP
+│  │  ├─ ITcpConnectionTerminator.h      # обрыв уже установленных исходящих сессий
+│  │  └─ Win32TcpConnectionTerminator.h  # GetExtendedTcpTable + SetTcpEntry
+│  ├─ Process/
+│  │  ├─ IProcessMonitor.h        # ProcessInfo + абстракция
+│  │  └─ Win32ProcessManager.h    # Toolhelp32 + фильтрация системных + иконки
+│  ├─ Input/
+│  │  ├─ IHotkeyManager.h         # HotkeyAction/HotkeyBinding + абстракция
+│  │  ├─ Win32HotkeyManager.h     # RegisterHotKey + скрытое окно-приёмник WM_HOTKEY
+│  │  └─ HotkeyCapture.h          # захват комбинации опросом GetAsyncKeyState
+│  ├─ UI/
+│  │  ├─ Renderer.h               # D3D11 + DirectComposition / colour-key fallback
+│  │  ├─ OverlayWindow.h          # окно приложения: перетаскивание, ресайз, клик-сквозь
+│  │  ├─ GifAnimator.h            # декодирование GIF (GDI+), тайминги кадров
+│  │  └─ UIManager.h              # ImGui-панель = окно, RGB-рамка окна, GIF, RU/ENG
+│  └─ App/Application.h           # композиционный корень, цикл сообщений и кадров
+└─ src/                           # реализации (зеркально include/universalfnaf)
+   ├─ main.cpp                    # wWinMain: COM STA, single instance, DPI
+   └─ Common|Core|Net|Process|Input|UI|App/*.cpp
+```
+
+`tools/check_sources.py` — вспомогательный статический контроль (баланс скобок,
+отсутствие TODO-заглушек). `tools/test_terminator.cpp` — отдельная утилита для
+проверки обрыва TCP-сессий на живом соединении (команда сборки — в шапке файла).
+
+---
+
+## 3. Сборка
+
+Требования: Windows 10/11, **Visual Studio 2022/2026** (Desktop C++ + Windows SDK
+10.0.19041+), CMake 3.24+, Git (для загрузки зависимостей), интернет при первой
+сборке (или локальные копии зависимостей).
+
+```powershell
+cd UniversalFnaf
+cmake --preset msvc-x64-release
+cmake --build --preset release
+# результат: build/msvc-x64-release/Release/UniversalFnaf.exe
+```
+
+Сборка через Ninja (быстрее) — **обязательно из x64-окружения**, иначе получится
+32-битный бинарник:
+
+```powershell
+# "x64 Native Tools Command Prompt for VS" либо:
+& "$env:ProgramFiles\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
+> Обычный «Developer PowerShell for VS» по умолчанию 32-битный: CMake выведет
+> предупреждение `configuring a 32-bit (x86) build`, а линкер — `LNK1246`, если
+> запросить 64-битную опцию защиты. Проект собирается и как x86, но целевая
+> конфигурация — x64.
+
+Dear ImGui компилируется в отдельную статическую библиотеку `universalfnaf_imgui`
+(исходники `imgui*.cpp` + бэкенды `imgui_impl_win32.cpp`, `imgui_impl_dx11.cpp`);
+она собирается с обычным уровнем предупреждений, чтобы `/W4 /permissive-` проекта
+не смешивался с предупреждениями стороннего кода. Дополнительно линкуются
+`d3dcompiler` (компиляция шейдеров ImGui в рантайме) и `imm32` (IME в Win32-бэкенде).
+
+Офлайн-сборка (зависимости уже скачаны вручную):
+
+```powershell
+cmake -S . -B build/off -G "Visual Studio 17 2022" -A x64 `
+      -DUNIVERSALFNAF_IMGUI_DIR=C:/deps/imgui `
+      -DUNIVERSALFNAF_JSON_DIR=C:/deps/json
+cmake --build build/off --config Release
+```
+
+### Проверенная сборка
+
+| Что | Значение |
+|---|---|
+| Компилятор | MSVC 19.51.36260 (Visual Studio 18.11 insiders), x64 и x86 |
+| Windows SDK | 10.0.26100.0 |
+| Генератор | Ninja, Release |
+| Результат | **0 ошибок, 0 предупреждений** (`/W4 /permissive- /guard:cf`) |
+| Артефакты | `UniversalFnaf.exe` ~950 КБ (x64) / ~836 КБ (x86), статический CRT, манифест встроен |
+
+Проверки рантайма на собранном бинарнике:
+
+```
+WFP        dynamic filtering session opened
+WFP        sub-layer ready (weight=0x7FFF)
+OVERLAY    window created 620x800 at (80,80) mode=DirectComposition
+D3D        device created (feature level 0xB100)
+D3D        swap chain created: 620x800 mode=DirectComposition (per-pixel alpha)
+UI         ImGui initialized (dpi scale 1.00)
+HOTKEY     registered Ctrl+Alt+F8/F9/F10/F11
+OVERLAY    window shown
+APP        startup completed
+```
+
+Окно — обычное окно приложения 620x800 (`MainWindowTitle = UniversalFnaf`,
+кнопка в панели задач), а не полноэкранный слой: остальной рабочий стол
+полностью доступен, окно перетаскивается на любой монитор.
+
+Проверка обрыва уже установленных сессий (отдельная утилита
+`tools/test_terminator.cpp`, собирается вручную, см. комментарий в файле):
+
+```
+established BEFORE: 1
+  local=192.168.0.27:56584 -> remote=1.1.1.1:80
+pid=3144 terminated=1 inboundKept=0 ipv6Untouched=0 failed=0
+established AFTER: 0
+```
+
+То есть открытая исходящая TCP-сессия действительно удаляется (не «повисает»),
+а сессии, принятые на слушающий порт процесса, сохраняются.
+
+* После принудительного завершения процесса (`Stop-Process -Force`) в
+  `netsh wfp show state` остаётся **0** упоминаний утилиты — динамическая сессия
+  сняла подслой и фильтры силами ядра.
+* Аудит импортов собранного PE: привязаны `FwpmEngineOpen0`, `FwpmFilterAdd0`,
+  `FwpmSubLayerAdd0`, `FwpmGetAppIdFromFileName0`, `RegisterHotKey`,
+  `D3D11CreateDevice`, `DCompositionCreateDevice`, `SetWindowDisplayAffinity`,
+  `CreateToolhelp32Snapshot`, `QueryFullProcessImageNameW`, `GdiplusStartup`,
+  `SetTcpEntry`; `WriteProcessMemory`, `ReadProcessMemory`, `CreateRemoteThread`,
+  `VirtualAllocEx`, `SetWindowsHookEx` — **отсутствуют**.
+* `mt.exe -inputresource:UniversalFnaf.exe;#1` подтверждает встроенный манифест
+  с `requireAdministrator` и `PerMonitorV2`.
+
+Особенности сборки:
+
+* `CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded...` — статический CRT: один
+  самодостаточный `.exe`, в манифесте не нужна ссылка на SxS-сборку CRT.
+* `resources/universalfnaf.rc` встраивает `app.manifest` как `RT_MANIFEST` id 1,
+  а линкеру передаётся `/MANIFEST:NO`, поэтому манифест ровно один и он
+  не зависит от генератора CMake.
+* `/utf-8 /W4 /permissive- /EHsc /guard:cf /DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA`.
+
+---
+
+## 4. Использование
+
+1. Запустить `UniversalFnaf.exe`, подтвердить UAC (нужен для WFP) — по умолчанию
+   используется `config.json` рядом с .exe, а если каталог не доступен на запись —
+   `%LOCALAPPDATA%\UniversalFnaf\config.json`.
+2. Окно — обычное окно приложения: **перетаскивается за заголовок**, размер меняется
+   потягиванием за правый нижний угол (треугольник), положение и размер сохраняются
+   в `config.json`. Кнопки `RU` / `EN` переключают язык интерфейса.
+3. Выбрать процесс в списке (иконка + имя + PID, системные процессы скрыты).
+4. Нажать **ЗАБЛОКИРОВАТЬ ТРАФИК** или хоткей (по умолчанию `Ctrl+Alt+F8`).
+
+Хоткеи по умолчанию:
+
+| Действие | Комбинация |
+|---|---|
+| Блокировка / разблокировка трафика | `Ctrl+Alt+F8` |
+| Сквозной клик (click-through) | `Ctrl+Alt+F9` |
+| Показать / скрыть окно | `Ctrl+Alt+F10` |
+| RGB-рамка вкл/выкл | `Ctrl+Alt+F11` |
+
+Логика UI:
+
+* Крупная кнопка-тумблер + индикатор: зелёный — трафик разрешён, красный — заблокирован.
+* RGB-рамка идёт **по периметру самого окна** (не экрана): оттенок плавно течёт по
+  контуру, есть «свечение» внутрь, регулируются толщина, скорость, насыщенность и
+  яркость. Состояние трафика показывает отдельная лампа, поэтому цвет рамки не несёт
+  смысловой нагрузки.
+* GIF рисуется в левом верхнем углу окна, рядом с ним — заголовок. Масштаб регулируется.
+* «Обзор…» открывает штатный `IFileOpenDialog`, привязанный к нашему окну, поэтому
+  диалог появляется **поверх** окна, а не за ним.
+* «Сохранить настройки» пишет `config.json` атомарно (tmp + `MoveFileEx`).
+* Сквозной клик: окно получает `WS_EX_TRANSPARENT` + `WM_NCHITTEST -> HTTRANSPARENT`,
+  и клики уходят в окно под ним. Пока он включён, мышью по панели не попасть —
+  вернуть управление можно хоткеем `Ctrl+Alt+F9` (подсказка выводится в панели).
+* «Игровой режим» (галочка *Не забирать фокус*) добавляет `WS_EX_NOACTIVATE`: окно
+  не активируется кликом и не снимает фокус с игры. В этом режиме поля ввода
+  недоступны — используйте список процессов и «Обзор…».
+* Захват новой комбинации: нажать кнопку хоткея и нажать клавиши. Захват идёт
+  опросом `GetAsyncKeyState`, поэтому не требует фокуса; `Esc` отменяет,
+  требуется модификатор (`Ctrl/Alt/Shift/Win`) или F-клавиша.
+
+---
+
+## 5. Как именно работает блокировка (WFP)
+
+* Движок открывается в **динамической сессии**: `FWPM_SESSION_FLAG_DYNAMIC`.
+  Все объекты живут, пока держится дескриптор; при завершении/падении процесса
+  ядро само удаляет фильтры и подслой — постоянных правил в системе не остаётся.
+* Создаётся собственный подслой `UniversalFnaf Outbound Filter` (GUID фиксирован,
+  weight `0x7FFF`) — он выше подслоя брандмауэра Windows, поэтому наш BLOCK
+  выигрывает у его permit-правил. Чужие правила не читаются и не изменяются.
+* Для цели добавляются два фильтра `FWP_ACTION_BLOCK` на слоях
+  `FWPM_LAYER_ALE_AUTH_CONNECT_V4` и `..._V6` с единственным условием
+  `FWPM_CONDITION_ALE_APP_ID` — блоб получается документированным
+  `FwpmGetAppIdFromFileName0` из пути к `.exe`.
+* Всё добавляется/удаляется внутри транзакции
+  (`FwpmTransactionBegin0` / `Commit` / `Abort`) — состояние не бывает «полу-применённым».
+* Каждая операция пишется в лог (`%LOCALAPPDATA%\UniversalFnaf\universalfnaf.log`) —
+  журнал пригоден для аудита: id фильтров, слой, время.
+
+Аудит вручную:
+
+```powershell
+netsh wfp show state file=wfp.xml      # пока утилита запущена — видно наш подслой и фильтры
+netsh wfp show filters file=filters.xml
+```
+
+### Что блокировка означает по семантике
+
+* Блокировка выполняется **по пути к образу**, а не по PID: WFP-условие `ALE_APP_ID`
+  — это и есть документированный способ «запретить программе сеть» (так работает и
+  брандмауэр Windows). PID нужен только для того, чтобы найти путь и показать цель
+  в UI; после блокировки ограничение действует на **все экземпляры** этого `.exe`.
+  Это осознанный компромисс: условий «по PID» на ALE-слоях для фильтров не
+  существует, а всё, что эмулирует такое поведение (callout-драйвер), уже
+  не является неинвазивным решением.
+* Новые соединения (TCP connect, UDP-потоки) блокируются немедленно.
+* **Уже установленные TCP-соединения** не проходят повторную авторизацию на
+  ALE-слоях, поэтому сами по себе они не рвутся. Чтобы блокировка была полной,
+  при включении блока (галочка *Обрывать установленные сессии*, включена по
+  умолчанию) вызывается `Win32TcpConnectionTerminator`:
+  `GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL)` → отбор сессий выбранного PID →
+  `SetTcpEntry(DELETE_TCB)`. Сессии, чей локальный порт совпадает со **слушающим
+  портом** того же процесса, считаются входящими и **не трогаются** — входящий
+  трафик продолжает работать. Кнопка «Разорвать соединения сейчас» делает то же
+  самое вручную. IPv6-сессии Windows удалять не позволяет (у `SetTcpEntry` нет
+  v6-варианта): для них блокируется только создание новых, а их количество
+  показывается в статусе.
+* Направление трафика: фильтры ставятся **только** на авторизацию исходящих
+  подключений (`ALE_AUTH_CONNECT_V4/V6`). Слои входящей авторизации
+  (`ALE_AUTH_RECV_ACCEPT`) не фильтруются вообще — адресованный процессу входящий
+  трафик и ответы на входящие соединения проходят как обычно.
+* Альтернатива, которую допускает задание, — Windows Firewall COM API
+  (`INetFwRules`): она оставляет **постоянные** правила в профиле брандмауэра и
+  требует ручной уборки, поэтому выбрана как запасной вариант, а не основной
+  (эскиз реализации — в `docs/ARCHITECTURE.md`).
+
+---
+
+## 6. Окно: прозрачность, DWM, перетаскивание и сквозной клик
+
+Окно — обычное окно приложения (620x800 по умолчанию), а не слой на весь экран:
+`WS_POPUP` без системной рамки (рамку рисует UI), `WS_EX_APPWINDOW` (кнопка в
+панели задач), `WS_EX_TOPMOST` (по умолчанию), опционально `WS_EX_NOACTIVATE`
+(«игровой режим») и `WS_EX_TRANSPARENT` (сквозной клик). Перетаскивание — за
+заголовок, изменение размера — за правый нижний угол; и то и другое реализовано
+через `SetWindowPos` по дельтам мыши, поэтому окно можно унести на любой монитор.
+При смене монитора/DPI окно автоматически подгоняется под рабочую область и
+масштаб интерфейса.
+
+Реализованы два документированных пути прозрачности (`Renderer`, `TransparencyMode`):
+
+1. **DirectComposition (по умолчанию)** — `CreateSwapChainForComposition` с
+   `DXGI_ALPHA_MODE_PREMULTIPLIED`, `DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL`, визуал
+   `IDCompositionVisual` привязан к окну с `WS_EX_NOREDIRECTIONBITMAP`.
+   DWM композитит кадр с истинной попиксельной альфой: скруглённые углы, мягкая
+   RGB-рамка со свечением, полупрозрачный фон — без `WS_EX_LAYERED`.
+   Блендинг ImGui (`SrcAlpha/InvSrcAlpha`, `SrcAlpha=ONE/DstAlpha=InvSrcAlpha`) поверх
+   прозрачно-чёрного клира даёт premultiplied-результат, который ожидает DWM.
+2. **Colour-key (fallback)** — классический `WS_EX_LAYERED` +
+   `SetLayeredWindowAttributes(key = чёрный, LWA_COLORKEY)` с bitblt-swap-chain.
+   Автоматически включается, если DirectComposition недоступен (старые VM, часть
+   удалённых сессий). Полупрозрачность при этом недоступна — только жёсткая маска.
+
+Дополнительно: `WM_ERASEBKGND -> 1`, `WM_MOUSEACTIVATE -> MA_NOACTIVATE` только в
+игровом режиме. Опционально — `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`,
+чтобы окно не попадало в скриншоты и записи экрана (по умолчанию **выключено**).
+
+---
+
+## 7. Подпись и сопровождение
+
+```powershell
+# после сборки Release
+signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
+  /a build\msvc-x64-release\Release\UniversalFnaf.exe
+```
+
+Рекомендации, снижающие вероятность ложных срабатываний:
+
+* подписывать бинарник (EV-сертификат для репутации);
+* не использовать упаковщики/протекторы и не менять секции постфактум;
+* не добавлять автозапуск и службы — утилита запускается вручную;
+* держать включённым журнал: все действия с WFP прозрачны и проверяемы.
+
+---
+
+## 8. Проверочный чек-лист
+
+| Проверка | Как убедиться |
+|---|---|
+| Нет инжекта/хуков | `Select-String` по списку API из §1 → пусто |
+| Нет чтения чужой памяти | В коде только `PROCESS_QUERY_LIMITED_INFORMATION` (grep по `OpenProcess`) |
+| Фильтры сессионные | `netsh wfp show state`: фильтры исчезают сразу после закрытия утилиты |
+| Уборка при аварийном завершении | Убить процесс через Диспетчер задач и повторить `netsh wfp show state` — правил нет |
+| Трафик действительно блокируется | Диспетчер ресурсов → вкладка «Сеть»: у выбранного процесса трафик пропадает |
+| Установленные сессии рвутся | `tools/test_terminator.exe <pid>` на живом соединении: `terminated=1`, `established AFTER: 0` |
+| Входящий трафик не тронут | Ни одного фильтра на `ALE_AUTH_RECV_ACCEPT`; сессии на слушающем порту сохраняются (`inboundKept`) |
+| Сквозной клик | Включить хоткеем, кликнуть по окну под панелью — нажатие доходит |
+| Окно обычное | Кнопка в панели задач, перетаскивается за заголовок, ресайз за нижний угол |
+| Фокус не крадётся | «Игровой режим»: клик по панели не активирует окно |
+| Манифест | `mt.exe -inputresource:UniversalFnaf.exe;#1 -out:m.xml` → `requireAdministrator` |
+
+---
+
+## 9. Известные ограничения
+
+1. IPv6-сессии Windows удалить не позволяет (`SetTcpEntry` работает только с IPv4).
+   Для них блокируется создание новых соединений, а количество уже открытых
+   показывается в статусе (`ipv6Untouched`).
+2. Блокировка действует на **все экземпляры** выбранного `.exe`, а не на один PID
+   (см. §5) — это документированная семантика WFP для правил по программе.
+3. Окно не «прилипает» к краям экрана (Aero Snap требует системной рамки). Позиция
+   всё равно запоминается, а при смене монитора окно подгоняется под рабочую область.
+4. GIF: GDI+ не выдаёт «disposal method» кадра, поэтому кадры накапливаются
+   композитингом — для GIF с disposal = 2 (restore to background) возможны «хвосты».
+   Практически все распространённые GIF используют disposal 0/1 и воспроизводятся
+   корректно.
+5. Colour-key режим не поддерживает полупрозрачность и свечение рамки.
+6. Прозрачные скруглённые углы окна остаются «кликабельными»: форма окна
+   прямоугольная (регион не обрезается, чтобы не конфликтовать с DirectComposition).
+7. Для работы WFP требуются права администратора; без них UI запускается, но
+   фильтрация недоступна и это явно показывается в статусе.
+8. Инструмент фильтрует трафик только на локальной машине и только для выбранной
+   программы. Использование для обхода правил сетей/сервисов, к которым у вас нет
+   прав, выходит за рамки назначения утилиты.
+
+---
+
+## 10. Лицензия и назначение
+
+Код предоставляется «как есть» для легитимной задачи: управление сетевым доступом
+собственных приложений на собственной машине. Автор не несёт ответственности за
+использование в нарушение правил третьих сторон.

@@ -1,0 +1,11 @@
+build/
+build-*/
+out/
+.vs/
+*.user
+*.suo
+*.db
+*.opendb
+*.log
+config.json
+CMakeUserPresets.json
