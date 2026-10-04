@@ -22,6 +22,8 @@ namespace {
 
 constexpr wchar_t kApplicationName[] = L"UniversalFnaf";
 constexpr int kTargetFpsWithoutVsync = 60;
+constexpr int kMinimumWindowWidth = 460;
+constexpr int kMinimumWindowHeight = 360;
 
 std::wstring LogFilePath()
 {
@@ -216,13 +218,15 @@ void Application::InstallWindowMessageHook()
                 const int height = HIWORD(lParam);
                 if (renderer_ != nullptr && renderer_->initialized() && width > 0 && height > 0 &&
                     (width != renderer_->width() || height != renderer_->height())) {
-                    uiManager_->InvalidateDeviceObjects();
+                    // Only the swap chain buffers are resized: ImGui's device
+                    // objects (font atlas, shaders) do not depend on the back
+                    // buffer size, and recreating them every frame is what made
+                    // resizing stutter.
                     std::wstring resizeError;
                     if (!renderer_->Resize(width, height, resizeError)) {
                         SetStatusError(L"Resize failed: " + resizeError);
                         running_ = false;
                     }
-                    uiManager_->RecreateDeviceObjects();
                 }
                 return 0;
             }
@@ -541,6 +545,11 @@ void Application::RefreshProcesses(bool force)
     const double age = std::chrono::duration<double>(now - lastProcessRefresh_).count();
     processListAgeSeconds_ = age;
     if (!force && age < refreshIntervalSeconds_) {
+        return;
+    }
+    if (!force && (windowDragging_ || windowResizing_)) {
+        // A snapshot walks every process and may load icons from disk; doing it
+        // mid-drag would show up as a hitch. It resumes on the next idle frame.
         return;
     }
     lastProcessRefresh_ = now;
@@ -923,17 +932,67 @@ void Application::ApplyRequests(const UiRequests& requests, UiState& state)
         state.language = requests.newLanguage;
     }
 
-    // --- window movement / resizing (declared by the UI each frame) ---------
-    if (requests.windowDrag) {
-        overlay_->MoveBy(static_cast<int>(std::lround(requests.windowDragX)),
-                         static_cast<int>(std::lround(requests.windowDragY)));
-        StoreWindowGeometry();
+    // --- window movement / resizing ----------------------------------------
+    // The UI only reports that a drag started / is still running; the position
+    // comes from the absolute cursor, so the window follows the mouse 1:1 and
+    // the movement can never feed back into the delta.
+    if (requests.windowDragBegin) {
+        POINT cursor{};
+        if (::GetCursorPos(&cursor) != FALSE) {
+            windowDragCursor_ = cursor;
+            windowDragBounds_ = overlay_->bounds();
+            windowDragging_ = true;
+        }
     }
-    if (requests.windowResize) {
-        overlay_->ResizeBy(static_cast<int>(std::lround(requests.windowResizeX)),
-                           static_cast<int>(std::lround(requests.windowResizeY)));
-        StoreWindowGeometry();
+    if (windowDragging_) {
+        if (requests.windowDragActive) {
+            POINT cursor{};
+            if (::GetCursorPos(&cursor) != FALSE) {
+                const int width = static_cast<int>(windowDragBounds_.right - windowDragBounds_.left);
+                const int height = static_cast<int>(windowDragBounds_.bottom - windowDragBounds_.top);
+                const int x = static_cast<int>(windowDragBounds_.left) + (cursor.x - windowDragCursor_.x);
+                const int y = static_cast<int>(windowDragBounds_.top) + (cursor.y - windowDragCursor_.y);
+                const RECT now = overlay_->bounds();
+                if (x != now.left || y != now.top) {
+                    overlay_->SetBounds(x, y, width, height);
+                    StoreWindowGeometry();
+                }
+            }
+        } else {
+            windowDragging_ = false;
+        }
     }
+
+    if (requests.windowResizeBegin) {
+        POINT cursor{};
+        if (::GetCursorPos(&cursor) != FALSE) {
+            windowResizeCursor_ = cursor;
+            windowResizeBounds_ = overlay_->bounds();
+            windowResizing_ = true;
+        }
+    }
+    if (windowResizing_) {
+        if (requests.windowResizeActive) {
+            POINT cursor{};
+            if (::GetCursorPos(&cursor) != FALSE) {
+                const int width = static_cast<int>(windowResizeBounds_.right - windowResizeBounds_.left);
+                const int height = static_cast<int>(windowResizeBounds_.bottom - windowResizeBounds_.top);
+                const int deltaX = static_cast<int>(cursor.x - windowResizeCursor_.x);
+                const int deltaY = static_cast<int>(cursor.y - windowResizeCursor_.y);
+                const int newWidth = std::max(kMinimumWindowWidth, width + deltaX);
+                const int newHeight = std::max(kMinimumWindowHeight, height + deltaY);
+                if (newWidth != width || newHeight != height) {
+                    overlay_->SetBounds(static_cast<int>(windowResizeBounds_.left),
+                                        static_cast<int>(windowResizeBounds_.top),
+                                        newWidth, newHeight);
+                    StoreWindowGeometry();
+                }
+            }
+        } else {
+            windowResizing_ = false;
+        }
+    }
+
     if (requests.resetWindowPosition) {
         overlay_->ResetPosition();
         EnsureWindowOnScreen();

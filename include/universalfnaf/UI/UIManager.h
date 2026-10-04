@@ -135,13 +135,14 @@ struct UiRequests {
     HotkeyAction rebindAction = HotkeyAction::ToggleBlocking;
     HotkeyBinding reboundBinding{};
 
-    // Window drag / resize for this frame, in pixels.
-    bool windowDrag = false;
-    float windowDragX = 0.0f;
-    float windowDragY = 0.0f;
-    bool windowResize = false;
-    float windowResizeX = 0.0f;
-    float windowResizeY = 0.0f;
+    // Window drag / resize. Only "begin" and "active" are published: the
+    // application reads the absolute cursor position with Win32 GetCursorPos(),
+    // because ImGui mouse coordinates are window relative - moving the window
+    // would feed back into the per-frame delta and make the drag oscillate.
+    bool windowDragBegin = false;
+    bool windowDragActive = false;
+    bool windowResizeBegin = false;
+    bool windowResizeActive = false;
 
     bool quit = false;
 };

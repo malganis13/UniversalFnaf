@@ -352,9 +352,10 @@ void OverlayWindow::MoveBy(int deltaX, int deltaY)
         return;
     }
     const RECT current = bounds();
-    ::SetWindowPos(window_, topmost_ ? HWND_TOPMOST : HWND_NOTOPMOST,
-                   current.left + deltaX, current.top + deltaY, 0, 0,
-                   SWP_NOSIZE | SWP_NOACTIVATE);
+    // SWP_NOZORDER: re-asserting TOPMOST on every frame forces DWM to reorder
+    // and recompose the window, which shows up as stutter while dragging.
+    ::SetWindowPos(window_, nullptr, current.left + deltaX, current.top + deltaY, 0, 0,
+                   SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     options_.x = current.left + deltaX;
     options_.y = current.top + deltaY;
 }
@@ -385,8 +386,10 @@ bool OverlayWindow::SetBounds(int x, int y, int width, int height)
     options_.y = y;
     options_.width = width;
     options_.height = height;
-    return ::SetWindowPos(window_, topmost_ ? HWND_TOPMOST : HWND_NOTOPMOST, x, y, width, height,
-                          SWP_NOACTIVATE) != FALSE;
+    // SWP_NOZORDER keeps the current topmost state without forcing a reorder on
+    // every frame (see MoveBy).
+    return ::SetWindowPos(window_, nullptr, x, y, width, height,
+                          SWP_NOZORDER | SWP_NOACTIVATE) != FALSE;
 }
 
 void OverlayWindow::EnsureOnScreen()

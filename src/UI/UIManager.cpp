@@ -35,6 +35,10 @@ namespace {
 
 constexpr float kPi = 3.14159265358979323846f;
 
+// Must match ImGuiStyle::WindowRounding set in ApplyDarkTheme: the RGB band is
+// drawn along the same corner radius as the panel background.
+constexpr float kWindowRounding = 12.0f;
+
 template <typename T>
 using ComPtr = Microsoft::WRL::ComPtr<T>;
 
@@ -57,7 +61,7 @@ void ApplyDarkTheme(float dpiScale)
 {
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowRounding = 12.0f;
+    style.WindowRounding = kWindowRounding;
     style.ChildRounding = 6.0f;
     style.FrameRounding = 5.0f;
     style.GrabRounding = 5.0f;
@@ -171,34 +175,66 @@ PerimeterPath BuildRoundedRectPath(const ImVec2& min, const ImVec2& max, float r
     return path;
 }
 
-// Emits one closed band of quads: from the path centre line offset by
-// `outerOffset` (positive = outward) to `innerOffset`.
-void EmitHueRing(ImDrawList* drawList, const PerimeterPath& path,
-                 float outerOffset, float innerOffset, float alpha,
+// Draws an anti-aliased band that follows the perimeter between two offsets of
+// the outward normal.
+//
+// ImGui's filled quads are not anti-aliased and AddPolyline has no per-vertex
+// colour, so the band is emitted as raw vertices: four "rails" across the
+// thickness (alpha 0 -> alpha -> alpha -> 0) give a one-pixel feather on both
+// edges, and every vertex carries the hue of its own arc position, which makes
+// the rainbow perfectly seamless - no chunk boundaries, no stepped colour.
+void EmitHueBand(ImDrawList* drawList, const PerimeterPath& path,
+                 float offsetOuter, float offsetInner,
+                 float alpha, float feather,
                  float hueBase, float saturation, float value)
 {
-    const std::size_t count = path.centers.size();
-    if (count < 4 || alpha <= 0.0f) {
+    const int count = static_cast<int>(path.centers.size());
+    if (count < 4 || alpha <= 0.001f) {
         return;
     }
-    for (std::size_t i = 0; i < count; ++i) {
-        const std::size_t j = (i + 1) % count;
-        const ImVec2& centerI = path.centers[i];
-        const ImVec2& normalI = path.normals[i];
-        const ImVec2& centerJ = path.centers[j];
-        const ImVec2& normalJ = path.normals[j];
 
-        const ImVec2 outerI(centerI.x + normalI.x * outerOffset, centerI.y + normalI.y * outerOffset);
-        const ImVec2 innerI(centerI.x + normalI.x * innerOffset, centerI.y + normalI.y * innerOffset);
-        const ImVec2 outerJ(centerJ.x + normalJ.x * outerOffset, centerJ.y + normalJ.y * outerOffset);
-        const ImVec2 innerJ(centerJ.x + normalJ.x * innerOffset, centerJ.y + normalJ.y * innerOffset);
+    const float soft = std::min(std::max(feather, 0.0f), std::abs(offsetOuter - offsetInner) * 0.5f);
+    const float rails[4] = {
+        offsetOuter,
+        offsetOuter - (offsetOuter > offsetInner ? soft : -soft),
+        offsetInner + (offsetOuter > offsetInner ? soft : -soft),
+        offsetInner,
+    };
+    const float railAlpha[4] = {0.0f, alpha, alpha, 0.0f};
 
-        // The closing segment wraps to arc 1.0, which equals arc 0.0 with a
-        // full-spectrum spread - the loop stays seamless.
-        const float arcJ = (j == 0) ? 1.0f : path.arc[j];
-        const float position = (path.arc[i] + arcJ) * 0.5f;
-        drawList->AddQuadFilled(outerI, outerJ, innerJ, innerI,
-                                HueColor(hueBase + position, saturation, value, alpha));
+    // White-pixel UV from the public font atlas API (ImDrawListSharedData is
+    // only visible to imgui_internal.h, which this file deliberately avoids).
+    const ImVec2 uv = ImGui::GetIO().Fonts->TexUvWhitePixel;
+    const unsigned int vertexBase = drawList->_VtxCurrentIdx;
+
+    // 4 rails x count samples, and 3 quad bands x 2 triangles per segment.
+    drawList->PrimReserve(count * 3 * 6, count * 4);
+
+    for (int i = 0; i < count; ++i) {
+        const ImVec2& center = path.centers[static_cast<std::size_t>(i)];
+        const ImVec2& normal = path.normals[static_cast<std::size_t>(i)];
+        const float hue = hueBase + path.arc[static_cast<std::size_t>(i)];
+        for (int rail = 0; rail < 4; ++rail) {
+            drawList->PrimWriteVtx(ImVec2(center.x + normal.x * rails[rail],
+                                          center.y + normal.y * rails[rail]),
+                                   uv, HueColor(hue, saturation, value, railAlpha[rail]));
+        }
+    }
+
+    for (int i = 0; i < count; ++i) {
+        const int j = (i + 1) % count;
+        for (int band = 0; band < 3; ++band) {
+            const ImDrawIdx a0 = static_cast<ImDrawIdx>(vertexBase + i * 4 + band);
+            const ImDrawIdx a1 = static_cast<ImDrawIdx>(vertexBase + i * 4 + band + 1);
+            const ImDrawIdx b0 = static_cast<ImDrawIdx>(vertexBase + j * 4 + band);
+            const ImDrawIdx b1 = static_cast<ImDrawIdx>(vertexBase + j * 4 + band + 1);
+            drawList->PrimWriteIdx(a0);
+            drawList->PrimWriteIdx(b0);
+            drawList->PrimWriteIdx(b1);
+            drawList->PrimWriteIdx(a0);
+            drawList->PrimWriteIdx(b1);
+            drawList->PrimWriteIdx(a1);
+        }
     }
 }
 
@@ -365,26 +401,30 @@ void UIManager::DrawWindowBorder(const UiState& state)
     }
 
     const float thickness = std::clamp(state.borderThickness * dpiScale_, 1.0f, 16.0f);
-    const float rounding = 16.0f * dpiScale_;
+    const float feather = std::min(1.0f * dpiScale_, thickness * 0.4f);
     const float inset = thickness * 0.5f + 1.0f;
+    // The band traces the very same rounded corner as the panel background, so
+    // the frame and the window edge look like one shape.
+    const float cornerRadius =
+        std::max(2.0f * dpiScale_, kWindowRounding * dpiScale_ - inset);
 
     const PerimeterPath path =
         BuildRoundedRectPath(ImVec2(inset, inset), ImVec2(display.x - inset, display.y - inset),
-                             rounding, 26, 8);
+                             cornerRadius, 30, 10);
 
     const float hue = huePhase_ - std::floor(huePhase_);
     const float saturation = std::clamp(state.borderSaturation, 0.0f, 1.0f);
     const float value = std::clamp(state.borderValue, 0.05f, 1.0f);
 
     if (state.borderGlow) {
-        // Neon bleed: one soft band inward, one thin halo outward.
-        EmitHueRing(drawList, path, -thickness * 0.5f, -thickness * 2.1f, 0.20f,
-                    hue, saturation, value);
-        EmitHueRing(drawList, path, thickness * 1.4f, thickness * 0.5f, 0.18f,
-                    hue, saturation, value);
+        // Neon bleed: two soft bands fading inwards, the outer edge stays crisp.
+        EmitHueBand(drawList, path, -thickness * 0.5f, -thickness * 1.7f, 0.30f,
+                    feather * 2.5f, hue, saturation, value);
+        EmitHueBand(drawList, path, -thickness * 1.7f, -thickness * 3.6f, 0.12f,
+                    feather * 4.0f, hue, saturation, value);
     }
-    EmitHueRing(drawList, path, thickness * 0.5f, -thickness * 0.5f, 1.0f,
-                hue, saturation, value);
+    EmitHueBand(drawList, path, thickness * 0.5f, -thickness * 0.5f, 1.0f,
+                feather, hue, saturation, value);
 }
 
 // ---------------------------------------------------------------------------
@@ -500,11 +540,11 @@ void UIManager::DrawHeaderBar(UiState& state, UiRequests& requests)
     ImGui::InvisibleButton("##window_drag", ImVec2(stripWidth, headerHeight));
     const bool dragHovered = ImGui::IsItemHovered();
     const bool dragActive = ImGui::IsItemActive();
-    if (dragActive && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-        const ImVec2 delta = ImGui::GetIO().MouseDelta;
-        requests.windowDrag = true;
-        requests.windowDragX = delta.x;
-        requests.windowDragY = delta.y;
+    if (ImGui::IsItemActivated()) {
+        requests.windowDragBegin = true;
+    }
+    if (dragActive) {
+        requests.windowDragActive = true;
     }
     if (dragHovered) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
@@ -585,11 +625,11 @@ void UIManager::DrawResizeGrip(UiRequests& requests)
             ImGui::SetTooltip("%s", Strings().resizeHint);
         }
     }
+    if (ImGui::IsItemActivated()) {
+        requests.windowResizeBegin = true;
+    }
     if (active) {
-        const ImVec2 delta = ImGui::GetIO().MouseDelta;
-        requests.windowResize = true;
-        requests.windowResizeX = delta.x;
-        requests.windowResizeY = delta.y;
+        requests.windowResizeActive = true;
     }
 
     ImDrawList* drawList = ImGui::GetWindowDrawList();

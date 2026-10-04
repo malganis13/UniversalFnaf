@@ -117,6 +117,16 @@ private:
     double processListAgeSeconds_ = 0.0;
     double refreshIntervalSeconds_ = 1.0;
 
+    // Absolute-cursor window drag / resize. ImGui mouse coordinates are relative
+    // to this window, so a per-frame delta would feed window movement back into
+    // itself; anchoring to GetCursorPos() removes that feedback loop.
+    bool windowDragging_ = false;
+    POINT windowDragCursor_{};
+    RECT windowDragBounds_{};
+    bool windowResizing_ = false;
+    POINT windowResizeCursor_{};
+    RECT windowResizeBounds_{};
+
     HINSTANCE instance_ = nullptr;
     bool running_ = false;
     bool initialized_ = false;
